@@ -1447,8 +1447,8 @@ class wpdb {
 		$new_link = true;
 
 		ini_set( 'display_errors', 1 );
-		if ( WP_DEBUG ) {
-			$this->dbh = sqlsrv_connect( $this->dbhost, array( "Database"=> $this->dbname, "UID"=> $this->dbuser, "PWD"=> $this->dbpassword, 'ReturnDatesAsStrings'=>true, 'MultipleActiveResultSets'=> false) );
+		if ( getenv('ProjectNami.UTF8') ) {
+			$this->dbh = sqlsrv_connect( $this->dbhost, array( "Database"=> $this->dbname, "UID"=> $this->dbuser, "PWD"=> $this->dbpassword, 'ReturnDatesAsStrings'=>true, 'MultipleActiveResultSets'=> false, 'CharacterSet'=> 'UTF-8') );
 		} else {
 			$this->dbh = sqlsrv_connect( $this->dbhost, array( "Database"=> $this->dbname, "UID"=> $this->dbuser, "PWD"=> $this->dbpassword, 'ReturnDatesAsStrings'=>true, 'MultipleActiveResultSets'=> false) );
 		}
@@ -1705,7 +1705,7 @@ class wpdb {
 					break;
 				default:
 					$begintransmsg = date("Y-m-d H:i:s") .  " Error Code: " . $errors[ 0 ][ 'code' ] . " -- Query NOT translated due to non-defined error code." . PHP_EOL .  $query . PHP_EOL;
-					error_log( $begintransmsg, 3, 'D:\home\LogFiles\php_errors.log' );				
+					error_log( $begintransmsg, 3, ERRORLOGFILE );				
             }
 		}
 		
@@ -1862,7 +1862,7 @@ class wpdb {
 		if ( false === $data ) {
 			return false;
 		}
-
+		
 		$formats = $values = array();
 		foreach ( $data as $value ) {
 			$formats[] = $value['format'];
@@ -1871,8 +1871,54 @@ class wpdb {
 
 		$fields  = '[' . implode( '], [', array_keys( $data ) ) . ']';
 		$formats = implode( ', ', $formats );
-
-		$sql = "$type INTO [$table] ($fields) VALUES ($formats)";
+	
+		if ($type == 'REPLACE') {
+			$columnNames = "'" . implode( "', '", array_keys($data)) . "'";
+			//Gets the key columns for the table		
+			$keyColQuery = "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+							WHERE TABLE_NAME = '$table' AND COLUMN_NAME IN ($columnNames)";
+			$this->query($keyColQuery);
+			
+			$keyNames = array();
+			$keyValues = array();
+			$keyFormats = array();		
+			$on = array();
+			
+			foreach($this->last_result as $row) {
+				$keyNames[] = $row->COLUMN_NAME;        
+			}
+		
+			foreach($keyNames as $keyCol) {				
+				$keyValues[] = $data[$keyCol]['value'];
+				$keyFormats[] = $data[$keyCol]['format'];
+				$on[] = "sourceTable.[$keyCol] = targetTable.[$keyCol]";
+			}			
+			
+					
+			$set = array();		
+			foreach($data as $field => $value) {			
+				$set[] = "[$field] = " . $value['format'];			
+			}
+			//exa:		
+			//$on[0] == "sourceTable.[keyCol1] = targetTable.[keyCol1]"
+			//$on[1] == "sourceTable.[keyCol2] = targetTable.[keyCol2]"
+			//$set[0] == "[field1] = %s"
+			//$set[1] == "[field2] = %d"
+			$on = implode(' AND ', $on);
+			$set = implode(', ', $set);
+			$keyFormat = implode(', ', $keyFormats); //if more than one key, looks like: keyCol1, keyCol2
+			$keyName = '[' . implode('], [', $keyNames) . ']';
+			//exa: $on == "sourceTable.keyCol1 = targetTable.keyCol1 AND sourceTable.keyCol2 = targetTable.keyCol2"
+			//exa: $set == "[field1] = %s, [field2] = %d"
+			$sql = "MERGE INTO $table WITH (HOLDLOCK) AS targetTable USING (SELECT $keyFormat) AS sourceTable ($keyName) ";
+			$sql .= "ON ($on) WHEN MATCHED THEN UPDATE SET $set WHEN NOT MATCHED THEN INSERT ($fields) VALUES ($formats);";
+			//Since there are the keyFormat and two sets of the original formats one for the UPDATE and one for the INSERT, 
+			//we need to concatenate the $keyFormats with 2 x $formats and $keyValues with 2 x $values arrays so that prepare can correctly match them up		
+			$values = array_merge($keyValues, $values, $values);
+		} else {
+			//INSERT
+			$sql = "$type INTO [$table] ($fields) VALUES ($formats)";
+		}
 
 		$this->check_current_query = false;
 		return $this->query( $this->prepare( $sql, $values ) );
@@ -2152,7 +2198,8 @@ class wpdb {
 
 		if ( $query && $x == 0 && $y == 0 ) {
 		
-			$result = sqlsrv_query($this->dbh, $query );
+   	        $this->_do_query( $query );
+            $result = $this->result;
 			
             // If there is an error, first attempt to translate
             $errors = sqlsrv_errors();
@@ -2184,11 +2231,12 @@ class wpdb {
                             error_log( $endtransmsg, 3, dirname( ini_get('error_log') ) . '\translate.log' ); 
 						}
 
-            			$result = sqlsrv_query($this->dbh, $query );
+   	                    $this->_do_query( $query );
+                        $result = $this->result;
 						break;
 					default:
 						$begintransmsg = date("Y-m-d H:i:s") .  " Error Code: " . $errors[ 0 ][ 'code' ] . " -- Query NOT translated due to non-defined error code." . PHP_EOL .  $query . PHP_EOL;
-						error_log( $begintransmsg, 3, 'D:\home\LogFiles\php_errors.log' );
+						error_log( $begintransmsg, 3, ERRORLOGFILE );
 				}
 		    }
 
@@ -3023,20 +3071,35 @@ class wpdb {
 	 * @access protected
 	 */
 	protected function load_col_info() {
-		if ( $this->col_info )
+    /**
+     * Derived in part from
+     *
+     * WordPress DB Class in W3 Total Cache
+     *
+     * Original code from {@link http://php.justinvincent.com Justin Vincent (justin@visunet.ie)}
+     *
+     */
+		if ( $this->col_info ) {
 			return;
+        }
 
-		if ( $this->use_mysqli ) {
-			$num_fields = mysqli_num_fields( $this->result );
-			for ( $i = 0; $i < $num_fields; $i++ ) {
-				$this->col_info[ $i ] = mysqli_fetch_field( $this->result );
-			}
-		} else {
-			$num_fields = mysql_num_fields( $this->result );
-			for ( $i = 0; $i < $num_fields; $i++ ) {
-				$this->col_info[ $i ] = mysql_fetch_field( $this->result, $i );
-			}
-		}
+        foreach( sqlsrv_field_metadata( $this->result ) as $field) {
+                $new_field = new stdClass();
+                $new_field->name = $field->name;
+                $new_field->table = null;
+                $new_field->def = null;
+                $new_field->max_length = $field->size;
+                $new_field->not_null = true;
+                $new_field->primary_key = null;
+                $new_field->unique_key = null;
+                $new_field->multiple_key = null;
+                $new_field->numeric = null;
+                $new_field->blob = null;
+                $new_field->type = $field->type;
+                $new_field->unsigned = null;
+                $new_field->zerofill = null;
+                $this->col_info[] = $new_field;
+        }
 	}
 
 	/**
